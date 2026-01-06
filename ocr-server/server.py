@@ -26,7 +26,7 @@ from waitress import serve
 # region Config
 IP_ADDRESS = os.environ.get("IP_ADDRESS", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 3000))
-CACHE_FILE_PATH = os.path.join(os.getcwd(), "ocr-cache.json")
+CACHE_FILE_PATH = os.environ.get("CACHE_FILE_PATH", os.path.join(os.getcwd(), "ocr-cache.json"))
 UPLOAD_FOLDER = "uploads"
 IMAGE_CACHE_FOLDER = "image_cache"
 AUTO_MERGE_CONFIG = {
@@ -284,6 +284,11 @@ def auto_merge_ocr_data(lines, natural_width, natural_height, config):
 
 def load_cache():
     global ocr_cache
+    # Ensure cache directory exists
+    cache_dir = os.path.dirname(CACHE_FILE_PATH)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    
     if os.path.exists(CACHE_FILE_PATH):
         try:
             with open(CACHE_FILE_PATH, "r", encoding="utf-8") as f:
@@ -292,7 +297,7 @@ def load_cache():
         except json.JSONDecodeError:
             print("[Cache] Warning: Could not decode JSON. Starting fresh.")
     else:
-        print("[Cache] No cache file found. Starting fresh.")
+        print(f"[Cache] No cache file found at {CACHE_FILE_PATH}. Starting fresh.")
 
 
 def save_cache():
@@ -387,11 +392,30 @@ async def ocr_endpoint():
     if not image_url:
         return jsonify({"error": "Image URL is required"}), 400
 
-    # Rewrite URL for Docker: replace localhost/127.0.0.1 with Docker host
+    # Rewrite URL for Docker: replace any Suwayomi URL with internal Docker URL
     suwayomi_host = os.environ.get("SUWAYOMI_HOST", "127.0.0.1")
-    if suwayomi_host != "127.0.0.1":
-        image_url = image_url.replace("127.0.0.1", suwayomi_host)
-        image_url = image_url.replace("localhost", suwayomi_host)
+    suwayomi_port = os.environ.get("SUWAYOMI_PORT", "4567")
+    internal_base = f"http://{suwayomi_host}:{suwayomi_port}"
+    
+    # List of patterns to rewrite to internal Docker URL
+    rewrite_patterns = [
+        "http://127.0.0.1:4567",
+        "http://localhost:4567",
+        "http://manga.local:4567",
+    ]
+    
+    # Also rewrite any custom external domain (from env var)
+    external_manga_domain = os.environ.get("EXTERNAL_MANGA_DOMAIN", "")
+    if external_manga_domain:
+        rewrite_patterns.append(f"https://{external_manga_domain}")
+        rewrite_patterns.append(f"http://{external_manga_domain}")
+    
+    for pattern in rewrite_patterns:
+        if pattern in image_url:
+            image_url = image_url.replace(pattern, internal_base)
+            if is_debug_mode:
+                print(f"[OCR] URL rewritten to: {image_url}")
+            break
 
     with cache_lock:
         if image_url in ocr_cache:
