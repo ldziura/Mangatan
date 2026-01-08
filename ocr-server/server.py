@@ -23,6 +23,15 @@ from flask import Flask, jsonify, request, send_file
 from PIL import Image
 from waitress import serve
 
+# Translation support
+try:
+    from deep_translator import GoogleTranslator
+    TRANSLATION_AVAILABLE = True
+    print("[Translation] deep-translator loaded successfully")
+except ImportError:
+    TRANSLATION_AVAILABLE = False
+    print("[Translation] deep-translator not installed, translation disabled")
+
 # region Config
 IP_ADDRESS = os.environ.get("IP_ADDRESS", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 3000))
@@ -55,6 +64,7 @@ cache_lock = threading.Lock()
 active_job_count = 0
 active_job_lock = threading.Lock()
 ocr_engine: Engine
+translation_cache = {}  # Cache for translations
 # endregion
 
 
@@ -380,6 +390,7 @@ def status_endpoint():
         "requests_processed": num_requests,
         "items_in_cache": num_cache_items,
         "active_preprocess_jobs": active_jobs,
+        "translation_available": TRANSLATION_AVAILABLE,
     })
 
 
@@ -572,6 +583,85 @@ def import_cache_endpoint():
         })
     except Exception as e:
         return jsonify({"error": f"Import failed: {e}"}), 500
+
+
+@app.route("/translate", methods=["POST"])
+def translate_endpoint():
+    """Translate text using Google Translate via deep-translator."""
+    if not TRANSLATION_AVAILABLE:
+        return jsonify({"error": "Translation not available. deep-translator not installed."}), 503
+    
+    data = request.json
+    if not data:
+        return jsonify({"error": "JSON payload required"}), 400
+    
+    text = data.get("text", "").strip()
+    source_lang = data.get("source", "ja")
+    target_lang = data.get("target", "en")
+    
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+    
+    # Check cache first
+    cache_key = f"{source_lang}:{target_lang}:{text}"
+    if cache_key in translation_cache:
+        return jsonify({"translation": translation_cache[cache_key], "cached": True})
+    
+    try:
+        translator = GoogleTranslator(source=source_lang, target=target_lang)
+        translation = translator.translate(text)
+        
+        # Cache the result
+        translation_cache[cache_key] = translation
+        
+        if is_debug_mode:
+            print(f"[Translation] {text[:30]}... -> {translation[:30]}...")
+        
+        return jsonify({"translation": translation, "cached": False})
+    except Exception as e:
+        print(f"[Translation] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/translate-batch", methods=["POST"])
+def translate_batch_endpoint():
+    """Translate multiple texts in a single request."""
+    if not TRANSLATION_AVAILABLE:
+        return jsonify({"error": "Translation not available. deep-translator not installed."}), 503
+    
+    data = request.json
+    if not data:
+        return jsonify({"error": "JSON payload required"}), 400
+    
+    texts = data.get("texts", [])
+    source_lang = data.get("source", "ja")
+    target_lang = data.get("target", "en")
+    
+    if not texts or not isinstance(texts, list):
+        return jsonify({"error": "No texts array provided"}), 400
+    
+    results = []
+    translator = GoogleTranslator(source=source_lang, target=target_lang)
+    
+    for text in texts:
+        text = text.strip() if text else ""
+        if not text:
+            results.append({"original": text, "translation": "", "cached": False})
+            continue
+        
+        cache_key = f"{source_lang}:{target_lang}:{text}"
+        if cache_key in translation_cache:
+            results.append({"original": text, "translation": translation_cache[cache_key], "cached": True})
+            continue
+        
+        try:
+            translation = translator.translate(text)
+            translation_cache[cache_key] = translation
+            results.append({"original": text, "translation": translation, "cached": False})
+        except Exception as e:
+            results.append({"original": text, "translation": "", "error": str(e)})
+    
+    return jsonify({"translations": results})
 
 
 # endregion

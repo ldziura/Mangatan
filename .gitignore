@@ -5,3 +5,6 @@ ocr-cache.json
 *.exe
 *.pyc
 ocr-server/nuitka-crash-report.xml
+
+# Userscript with real domain (use desktop-script.user.js.example)
+desktop-script.user.js
