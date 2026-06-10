@@ -1,6 +1,9 @@
 from abc import ABC, abstractmethod
 from math import pi
 from typing import TypedDict
+import asyncio
+import os
+import threading
 
 
 import chrome_lens_py
@@ -245,12 +248,210 @@ class AppleVision(Engine):
         return []
 
 
-def initialize_engine(engine_name: str) -> Engine:
-    engine_name = engine_name.strip().lower()
+class MangaOCR(Engine):
+    """Local, fully-offline detect+recognize pipeline via mokuro
+    (comic-text-detector for bubble/line detection + kha-white/manga-ocr for recognition).
 
-    if engine_name == "lens":
-        return GoogleLens()
-    elif engine_name == "oneocr":
-        return OneOCR()
-    else:
-        raise ValueError(f"Invalid engine: {engine_name}")
+    manga-ocr is recognition-only (crop -> string, no boxes), so we use mokuro's bundled
+    comic-text-detector to find text blocks/lines, then recognize each line. We construct
+    `mokuro.MangaPageOcr` for its `.text_detector`, `.mocr` and `.split_into_chunks`, but we
+    do NOT call `MangaPageOcr.__call__` (it reads a FILE PATH); instead we run its pipeline
+    against the in-memory PIL page. One Bubble is emitted per detected line, which matches
+    what server.py's auto_merge_ocr_data() expects (it groups lines into bubbles).
+
+    Heavy deps (torch/cv2/numpy/mokuro) are imported lazily so this module still imports on a
+    lens-only image. Set MANGAOCR_FORCE_CPU=1 to skip CUDA.
+    """
+
+    # Serializes GPU/model access across worker threads — manga-ocr + comic-text-detector
+    # share one CUDA context with bounded VRAM. MUST be a *threading* primitive, not
+    # asyncio.Semaphore: Flask[async] under waitress runs each request in its own event loop,
+    # so an asyncio semaphore created at import binds to the first loop and raises
+    # "Future attached to a different loop" on every later request.
+    _gpu_lock = threading.Semaphore(1)
+
+    def __init__(self, force_cpu: bool = False):
+        force_cpu = force_cpu or os.environ.get("MANGAOCR_FORCE_CPU", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        # Lazy import: only pull the torch/mokuro stack when this engine is actually selected.
+        from mokuro import MangaPageOcr
+
+        self._MangaPageOcr = MangaPageOcr
+        # First construction downloads (then caches) comictextdetector.pt (~76 MB) and
+        # kha-white/manga-ocr-base (~444 MB). Auto-selects CUDA when available unless force_cpu.
+        self.mpocr = MangaPageOcr(
+            pretrained_model_name_or_path="kha-white/manga-ocr-base",
+            force_cpu=force_cpu,
+            detector_input_size=1024,
+            text_height=64,
+            max_ratio_vert=16,
+            max_ratio_hor=8,
+            anchor_window=2,
+            disable_ocr=False,
+        )
+        print("[Engine] MangaOCR ready (mokuro: comic-text-detector + manga-ocr, "
+              f"force_cpu={force_cpu})")
+
+    async def ocr(self, img: Image) -> list[Bubble]:
+        # Blocking torch inference -> run off the event loop (GPU access serialized in _ocr_sync).
+        return await asyncio.to_thread(self._ocr_sync, img)
+
+    def _ocr_sync(self, img: Image) -> list[Bubble]:
+        import cv2
+        import numpy as np
+        from PIL import Image as PILImageModule
+
+        W, H = img.size
+        if not W or not H:
+            return []
+
+        # comic-text-detector expects a BGR ndarray; PIL is RGB.
+        rgb = np.asarray(img.convert("RGB"))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+        bubbles: list[Bubble] = []
+        # Hold the GPU for the whole page: one CUDA context, one page at a time.
+        with self._gpu_lock:
+            # refine_mode=1 == REFINEMASK_ANNOTATION; returns (mask, mask_refined, blk_list).
+            _, mask_refined, blk_list = self.mpocr.text_detector(
+                bgr, refine_mode=1, keep_undetected_mask=True
+            )
+
+            for blk in blk_list:
+                try:
+                    vertical = bool(getattr(blk, "vertical", False))
+                    block_orientation = 90.0 if vertical else 0.0
+                    font_px = float(getattr(blk, "font_size", 0) or 0)
+                    if font_px < 0:  # detector returns -1 when it can't estimate
+                        font_px = 0
+                    max_ratio = (
+                        self.mpocr.max_ratio_vert if vertical else self.mpocr.max_ratio_hor
+                    )
+
+                    lines = blk.lines_array()  # per-line quad polygons (4 pts, pixel coords)
+                    for line_idx, line in enumerate(lines):
+                        line_crops, _ = self._MangaPageOcr.split_into_chunks(
+                            bgr,
+                            mask_refined,
+                            blk,
+                            line_idx,
+                            textheight=self.mpocr.text_height,
+                            max_ratio=max_ratio,
+                            anchor_window=self.mpocr.anchor_window,
+                        )
+                        text = ""
+                        for crop in line_crops:
+                            if vertical:
+                                crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
+                            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                            text += self.mpocr.mocr(PILImageModule.fromarray(crop_rgb))
+
+                        text = text.strip()
+                        if not text:
+                            continue
+
+                        pts = np.asarray(line, dtype=np.float64).reshape(-1, 2)
+                        x_min, y_min = float(pts[:, 0].min()), float(pts[:, 1].min())
+                        x_max, y_max = float(pts[:, 0].max()), float(pts[:, 1].max())
+                        bw, bh = (x_max - x_min), (y_max - y_min)
+                        if bw <= 0 or bh <= 0:
+                            continue
+
+                        bubbles.append(
+                            Bubble(
+                                text=text,
+                                tightBoundingBox=BoundingBox(
+                                    x=x_min / W,
+                                    y=y_min / H,
+                                    width=bw / W,
+                                    height=bh / H,
+                                ),
+                                # per-line aspect overrides the block flag when unambiguous
+                                orientation=90.0 if bh > bw else block_orientation,
+                                font_size=(font_px / H) if font_px > 0 else 0.04,
+                                confidence=0.95,  # detector/recognizer expose no per-line score
+                            )
+                        )
+                except Exception as e:
+                    # One bad block must not drop the whole page; keep what we have.
+                    print(f"[Engine] MangaOCR skipped a block: {e}")
+                    continue
+
+        return bubbles
+
+
+class FallbackEngine(Engine):
+    """Runs engines in order; uses the next one when an engine raises OR returns no text.
+
+    Used for the default 'mangaocr+lens' chain: try the local manga-ocr pipeline first, and
+    fall back to Google Lens if it errors or finds nothing on a page.
+    """
+
+    def __init__(self, engines: list[Engine]):
+        if not engines:
+            raise ValueError("FallbackEngine requires at least one engine")
+        self.engines = engines
+
+    async def ocr(self, img: Image) -> list[Bubble]:
+        last: list[Bubble] = []
+        for i, engine in enumerate(self.engines):
+            name = type(engine).__name__
+            try:
+                result = await engine.ocr(img)
+            except Exception as e:
+                print(f"[Engine] {name} raised ({e}); falling back to next engine")
+                continue
+            if result:
+                if i > 0:
+                    print(f"[Engine] {name} (fallback #{i}) produced {len(result)} line(s)")
+                return result
+            if i < len(self.engines) - 1:
+                print(f"[Engine] {name} found no text; trying next engine")
+            else:
+                print(f"[Engine] {name} (last in chain) found no text")
+            last = result
+        return last
+
+
+_ENGINE_BUILDERS = {
+    "lens": GoogleLens,
+    "oneocr": OneOCR,
+    "mangaocr": MangaOCR,
+    "applevision": AppleVision,
+}
+
+
+def _build_one(name: str) -> Engine:
+    name = name.strip().lower()
+    builder = _ENGINE_BUILDERS.get(name)
+    if builder is None:
+        raise ValueError(f"Invalid engine: {name}")
+    return builder()
+
+
+def initialize_engine(engine_name: str) -> Engine:
+    """Build an engine, or a fallback chain via '+': e.g. 'mangaocr+lens' tries the local
+    manga-ocr pipeline first and falls back to Google Lens. Engines that fail to construct
+    are skipped, so a broken primary (e.g. missing model) still leaves the fallback working.
+    """
+    parts = [p for p in engine_name.strip().lower().split("+") if p]
+    if not parts:
+        raise ValueError(f"Invalid engine: {engine_name!r}")
+
+    if len(parts) == 1:
+        return _build_one(parts[0])
+
+    built: list[Engine] = []
+    for p in parts:
+        try:
+            built.append(_build_one(p))
+        except Exception as e:
+            print(f"[Engine] '{p}' failed to initialize, skipping in fallback chain: {e}")
+    if not built:
+        raise ValueError(f"No engine in chain {engine_name!r} could be initialized")
+    if len(built) == 1:
+        return built[0]
+    return FallbackEngine(built)

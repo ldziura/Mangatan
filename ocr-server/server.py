@@ -673,7 +673,17 @@ def main():
     global ocr_engine, is_debug_mode
     parser = argparse.ArgumentParser(description="Run the Python OCR Server.")
     parser.add_argument("-d", "--debug", action="store_true", help="enable debug mode")
-    parser.add_argument("-e", "--engine", type=str, default="lens", help="OCR engine to use: 'lens', 'oneocr'")
+    parser.add_argument(
+        "-e",
+        "--engine",
+        type=str,
+        default=os.environ.get("OCR_ENGINE", "mangaocr+lens"),
+        help=(
+            "OCR engine: 'mangaocr' (local manga-ocr+detector), 'lens' (Google Lens), "
+            "'oneocr'. Use '+' for a fallback chain (default 'mangaocr+lens' = local first, "
+            "Google Lens fallback). Overridable via the OCR_ENGINE env var."
+        ),
+    )
     args = parser.parse_args()
     is_debug_mode = args.debug
 

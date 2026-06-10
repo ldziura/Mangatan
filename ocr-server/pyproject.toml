@@ -13,6 +13,17 @@ dependencies = [
     "oneocr>=1.0.9",
     "requests>=2.32.4",
     "waitress>=3.0.2",
+    # Local OCR engine ('mangaocr'): mokuro bundles comic-text-detector (text/bubble
+    # detection) and pulls kha-white/manga-ocr (recognition). torch/torchvision are listed
+    # explicitly so [tool.uv.sources] can route them to the CUDA wheel index on Linux.
+    "mokuro==0.2.4",
+    "torch",
+    "torchvision",
+    "numpy<2",
+    # manga-ocr only sets a loose transformers lower bound, so an unpinned resolve grabs
+    # transformers 5.x whose TrOCR/processor API changes break manga-ocr at runtime. Pin to
+    # the 4.x line it was built against.
+    "transformers>=4.40,<5",
 ]
 
 [dependency-groups]
@@ -20,3 +31,16 @@ dev = [
     "nuitka>=2.7.12",
     "pytest>=8.4.1",
 ]
+
+# torch/torchvision come from PyTorch's CUDA wheel index on Linux (GPU inference on the
+# RTX 2070 SUPER). The torch wheels bundle their own CUDA runtime, so no nvidia/cuda base
+# image is needed — only the host driver + nvidia-container-toolkit (the compose GPU
+# reservation provides this). On non-Linux (e.g. the dev box) torch resolves from PyPI.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu124", marker = "sys_platform == 'linux'" }]
